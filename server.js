@@ -195,52 +195,58 @@ app.post('/contas/pagar', async (req, res) => {
 
 // --- ESTORNAR ---
 // --- ROTA DE ESTORNO INTELIGENTE (CORRIGIDA) ---
+// --- ESTORNO SEGURO (COM LIMPEZA) ---
 app.post('/contas/estornar', async (req, res) => {
     const usuario_id = req.headers['user-id'];
     const { conta_id } = req.body;
     
     try {
-        // 1. Busca TODOS os pagamentos dessa conta (Removemos o LIMIT 1)
-        const pagamentos = await pool.query(`
-            SELECT id, carteira_id, valor FROM movimentacoes 
+        // 1. Soma TUDO que já foi pago nessa conta (pra não ter erro de parcelas)
+        const somaPagamentos = await pool.query(`
+            SELECT SUM(valor) as total, carteira_id 
+            FROM movimentacoes 
+            WHERE conta_id = $1 AND tipo = 'SAIDA' AND usuario_id = $2
+            GROUP BY carteira_id
+        `, [conta_id, usuario_id]);
+
+        if (somaPagamentos.rows.length === 0) {
+            return res.status(404).json({ erro: "Nada para estornar. Conta limpa." });
+        }
+
+        // 2. Devolve o dinheiro para cada carteira que pagou
+        for (const item of somaPagamentos.rows) {
+            const valorParaDevolver = Number(item.total);
+            
+            // Devolve pra carteira
+            await pool.query(`UPDATE carteiras SET saldo = saldo + $1 WHERE id = $2`, 
+                [valorParaDevolver, item.carteira_id]
+            );
+            
+            // Cria um registro de Estorno (Entrada) só pra ficar no histórico visual
+            await pool.query(`
+                INSERT INTO movimentacoes (usuario_id, conta_id, carteira_id, valor, tipo, descricao, data_pagamento)
+                VALUES ($1, $2, $3, $4, 'ENTRADA', 'Estorno', NOW())
+            `, [usuario_id, conta_id, item.carteira_id, valorParaDevolver]);
+        }
+
+        // 3. A MÁGICA: Apaga os registros de SAÍDA antigos dessa conta.
+        // Assim, se você clicar em estornar de novo, ele não acha nada e não devolve dinheiro infinito.
+        await pool.query(`
+            DELETE FROM movimentacoes 
             WHERE conta_id = $1 AND tipo = 'SAIDA' AND usuario_id = $2
         `, [conta_id, usuario_id]);
 
-        if (pagamentos.rows.length === 0) {
-            return res.status(404).json({ erro: "Nenhum pagamento encontrado para estornar" });
-        }
-
-        // 2. Loop: Para cada pagamento encontrado, devolve o dinheiro para a carteira correta
-        // (Isso é importante caso você tenha pago uma parte com o Banco e outra com a Carteira)
-        for (const pag of pagamentos.rows) {
-            
-            // Devolve o saldo
-            await pool.query(`UPDATE carteiras SET saldo = saldo + $1 WHERE id = $2`, 
-                [pag.valor, pag.carteira_id]
-            );
-
-            // Registra o estorno no histórico para ficar bonito no extrato
-            await pool.query(`
-                INSERT INTO movimentacoes (usuario_id, conta_id, carteira_id, valor, tipo, descricao, data_pagamento)
-                VALUES ($1, $2, $3, $4, 'ENTRADA', 'Estorno Total', NOW())
-            `, [usuario_id, conta_id, pag.carteira_id, pag.valor]);
-        }
-
-        // 3. Reseta a conta para o estado original (Como se nunca tivesse sido paga)
-        // O valor volta a ser o valor_original e o status PENDENTE
+        // 4. Reseta a conta para PENDENTE
         await pool.query(`
             UPDATE contas SET status = 'PENDENTE', valor = valor_original 
             WHERE id = $1 AND usuario_id = $2
         `, [conta_id, usuario_id]);
-        
-        // 4. (Opcional) Limpar os registros de SAIDA antigos para não duplicar no futuro? 
-        // Não recomendo deletar histórico financeiro, melhor deixar lá e lançar o estorno (como fizemos acima).
 
-        res.json({ mensagem: "Conta estornada e todo o dinheiro devolvido!" });
+        res.json({ mensagem: "Estorno realizado e histórico limpo!" });
 
     } catch (erro) {
         console.error(erro);
-        res.status(500).json({ erro: "Erro ao realizar estorno" });
+        res.status(500).json({ erro: "Erro ao estornar" });
     }
 });
 
@@ -265,3 +271,4 @@ app.get('/movimentacoes', async (req, res) => {
     }
 
 });
+
